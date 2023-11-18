@@ -61,12 +61,14 @@ class LatentAscent(scripts.Script):
     optimizer: torch.optim.Optimizer | None = None
     chosen_at: int = -1
     iteration: int = 0
+    original_cond: torch.Tensor | None = None
     win_cond: torch.Tensor | None = None
     loss_cond: torch.Tensor | None = None
     opt_state: dict | None = None
     learning_rate: float = 0.1
     momentum: float = 0.9
     traces: list[torch.Tensor] = [None, None]
+    noise_scale: float = 0.025
     # next_latents: list[torch.Tensor | None] = [None, None]
 
     # Extension title in menu UI
@@ -89,29 +91,49 @@ class LatentAscent(scripts.Script):
                 )
                 select_winner = gr.Button("Choose", elem_id="la_select_winner")
 
-                def _choose_winner():
+                def _choose_winner(winner_val):
                     if self.chosen_at == self.iteration:
                         return
-                    intwinner = int(winner.value == "Right")
+                    intwinner = int(winner_val == "Right")
                     win_cond = self.latents[intwinner]
                     loss_cond = self.latents[1 - intwinner]
-                    loss = dpo_loss_clip(win_cond, loss_cond, self.latents[0])
+                    loss = dpo_loss_clip(win_cond, loss_cond, self.original_cond)
                     params = [win_cond, loss_cond]
                     grads = torch.autograd.grad(loss, params)
                     traces = [
-                        g.add_((self.momentum * t) if t is not None else 0)
+                        (g * self.noise_scale / torch.linalg.norm(g.view(-1))).add_((self.momentum * t) if t is not None else 0)
                         for g, t in zip(grads, self.traces)
                     ]
                     self.traces = traces
-                    self.latents = [
-                        v + t * -self.learning_rate
-                        for v, t in zip(self.latents, traces)
-                    ]
+                    with torch.no_grad():
+                        new_gen = win_cond - traces[0] #* -self.learning_rate
+                        self.latents = [
+                            new_gen.requires_grad_(),
+                            self.add_noise(new_gen, self.noise_scale).requires_grad_()
+                        ]
+                    # self.latents = [
+                    #     v + t * -self.learning_rate
+                    #     for v, t in zip(self.latents, traces)
+                    # ]
                     self.chosen_at = self.iteration
                     self.win_cond = win_cond
                     self.loss_cond = loss_cond
 
-                select_winner.click(_choose_winner)
+                select_winner.click(_choose_winner, inputs=[winner])
+
+            reset = gr.Button("Reset", elem_id="la_reset")
+
+            def _reset():
+                self.latents = [None, None]
+                self.optimizer = None
+                self.chosen_at = -1
+                self.iteration = 0
+                self.win_cond = None
+                self.loss_cond = None
+                self.opt_state = None
+                self.traces = [None, None]
+            
+            reset.click(_reset)
 
         self.infotext_fields = [
             (active, "LA Active"),
@@ -122,7 +144,7 @@ class LatentAscent(scripts.Script):
             "la_winner",
             "la_select_winner",
         ]
-        return [active, winner, select_winner]
+        return [active, winner, select_winner, reset]
 
     def before_process(self, p: StableDiffusionProcessing, *args):
         # Set batch size and batch count to 1 and 2 respectively to produce and A and B sample
@@ -178,7 +200,7 @@ class LatentAscent(scripts.Script):
     #     else:
     #         logger.debug("Warning: NaN encountered in rescaling")
     def add_noise(self, y, scale=0.1):
-        rng.manual_seed(1337)
+        rng.manual_seed(1337 + self.iteration)
         return y + rng.randn_like(y) * scale
 
     def on_cfg_denoiser_callback(
@@ -190,13 +212,13 @@ class LatentAscent(scripts.Script):
             if params.sampling_step == 0:
                 sampling_step = params.sampling_step
                 text_cond: torch.Tensor = params.text_cond
-
                 text_uncond: torch.Tensor = params.text_uncond
                 if batch_num == 0:
+                    self.original_cond = text_cond.clone()
                     new_cond = text_cond.requires_grad_()
                     params.text_cond = new_cond
                 else:
-                    new_cond = self.add_noise(text_cond, 0.025).requires_grad_()
+                    new_cond = self.add_noise(text_cond, self.noise_scale).requires_grad_()
                     params.text_cond = new_cond
                 self.latents[batch_num] = params.text_cond
             else:
