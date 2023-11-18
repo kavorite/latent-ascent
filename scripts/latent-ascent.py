@@ -67,7 +67,7 @@ class LatentAscent(scripts.Script):
     opt_state: dict | None = None
     learning_rate: float = 0.1
     momentum: float = 0.9
-    traces: list[torch.Tensor] = [None, None]
+    trace: torch.Tensor | None = [None]
     noise_scale: float = 0.025
     # next_latents: list[torch.Tensor | None] = [None, None]
 
@@ -98,26 +98,17 @@ class LatentAscent(scripts.Script):
                     win_cond = self.latents[intwinner]
                     loss_cond = self.latents[1 - intwinner]
                     loss = dpo_loss_clip(win_cond, loss_cond, self.original_cond)
-                    params = [win_cond, loss_cond]
-                    grads = torch.autograd.grad(loss, params)
-                    traces = [
-                        (g * self.noise_scale / torch.linalg.norm(g.view(-1))).add_((self.momentum * t) if t is not None else 0)
-                        for g, t in zip(grads, self.traces)
-                    ]
-                    self.traces = traces
+                    grads = torch.autograd.grad(loss, [win_cond])
+                    grads *= self.noise_scale / torch.linalg.norm(grads.view(-1))
+                    trace = self.trace or 0
+                    alpha = self.momentum
+                    alpha1m = 1 - alpha
+                    trace = trace * alpha + alpha1m * grads
                     with torch.no_grad():
-                        new_gen = win_cond - traces[0] #* -self.learning_rate
-                        self.latents = [
-                            new_gen.requires_grad_(),
-                            self.add_noise(new_gen, self.noise_scale).requires_grad_()
-                        ]
-                    # self.latents = [
-                    #     v + t * -self.learning_rate
-                    #     for v, t in zip(self.latents, traces)
-                    # ]
+                        noise_scale = self.noise_scale * alpha1m
+                        self.loss_cond = self.add_noise(win_cond - trace, noise_scale)
+                    self.trace = trace
                     self.chosen_at = self.iteration
-                    self.win_cond = win_cond
-                    self.loss_cond = loss_cond
 
                 select_winner.click(_choose_winner, inputs=[winner])
 
@@ -132,7 +123,7 @@ class LatentAscent(scripts.Script):
                 self.loss_cond = None
                 self.opt_state = None
                 self.traces = [None, None]
-            
+
             reset.click(_reset)
 
         self.infotext_fields = [
@@ -218,7 +209,9 @@ class LatentAscent(scripts.Script):
                     new_cond = text_cond.requires_grad_()
                     params.text_cond = new_cond
                 else:
-                    new_cond = self.add_noise(text_cond, self.noise_scale).requires_grad_()
+                    new_cond = self.add_noise(
+                        text_cond, self.noise_scale
+                    ).requires_grad_()
                     params.text_cond = new_cond
                 self.latents[batch_num] = params.text_cond
             else:
